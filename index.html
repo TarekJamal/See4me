@@ -31,17 +31,14 @@
   <canvas id="canvas" hidden></canvas>
 
 <script type="module">
-// مكتبة Transformers.js تشغّل النماذج داخل المتصفح (مجانية بالكامل)
-import { Florence2ForConditionalGeneration, AutoProcessor, AutoTokenizer, RawImage, pipeline }
-  from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
+// نسخة خفيفة: نموذج وصف صغير (~150MB) بدل Florence-2 الثقيل
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
+env.backends.onnx.wasm.numThreads = 1; // أقل استهلاكاً للذاكرة
 
 const $ = id => document.getElementById(id);
 const video = $('video'), statusEl = $('status'), canvas = $('canvas');
 const startBtn = $('start'), describeBtn = $('describe'), repeatBtn = $('repeat');
-
-const MODEL_ID = 'onnx-community/Florence-2-base-ft'; // نموذج وصف الصور
-const TASK = '<DETAILED_CAPTION>';                     // للأسرع استخدم '<CAPTION>'
-let model, processor, tokenizer, translator, busy = false, lastText = '';
+let captioner, translator, busy = false, lastText = '';
 
 /* ---------- النطق بالعربية ---------- */
 let arVoice = null;
@@ -52,7 +49,6 @@ function pickVoice() {
          || v.find(x => x.lang.toLowerCase().startsWith('ar')) || null;
 }
 speechSynthesis.onvoiceschanged = pickVoice; pickVoice();
-
 function speak(text) {
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
@@ -61,26 +57,8 @@ function speak(text) {
   u.rate = 0.95;
   speechSynthesis.speak(u);
 }
-// عرض النص + نطقه
 function say(text) { statusEl.textContent = text; speak(text); lastText = text; }
-
-/* ---------- تحميل نموذج مع محاولات احتياطية ---------- */
-async function loadModel() {
-  const onProgress = p => {
-    if (p.status === 'progress') statusEl.textContent = `جارٍ التحميل ${Math.round(p.progress)}%`;
-  };
-  // الترتيب: WebGPU (الأسرع) ثم نسخة مضغوطة ثم الكاملة
-  const configs = [];
-  if (navigator.gpu) configs.push({ device: 'webgpu',
-    dtype: { embed_tokens: 'fp16', vision_encoder: 'fp16', encoder_model: 'q4', decoder_model_merged: 'q4' } });
-  configs.push({ dtype: 'q8' }, { dtype: 'fp32' });
-  for (const cfg of configs) {
-    try {
-      return await Florence2ForConditionalGeneration.from_pretrained(MODEL_ID, { ...cfg, progress_callback: onProgress });
-    } catch (e) { console.warn('فشلت الإعدادات', cfg, e); }
-  }
-  throw new Error('تعذر تحميل النموذج');
-}
+const onProgress = p => { if (p.status === 'progress') statusEl.textContent = `جارٍ التحميل ${Math.round(p.progress)}%`; };
 
 /* ---------- البدء ---------- */
 startBtn.onclick = async () => {
@@ -88,23 +66,22 @@ startBtn.onclick = async () => {
   try {
     say('جارٍ تشغيل الكاميرا');
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' } }, audio: false }); // الكاميرا الخلفية
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 } }, audio: false });
     video.srcObject = stream; await video.play();
 
-    say('جارٍ تحميل النموذج. في المرة الأولى قد يستغرق عدة دقائق، يرجى الانتظار');
-    model = await loadModel();
-    processor = await AutoProcessor.from_pretrained(MODEL_ID);
-    tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
+    say('جارٍ تحميل نموذج الوصف، يرجى الانتظار');
+    captioner = await pipeline('image-to-text', 'Xenova/vit-gpt2-image-captioning', { progress_callback: onProgress });
 
-    // مترجم محلي من الإنجليزية إلى العربية (اختياري: لو فشل نكمل بالإنجليزية)
-    try { translator = await pipeline('translation', 'Xenova/opus-mt-en-ar'); }
+    // الترجمة تُحمَّل بعد ذلك (وليس معه) لتخفيف الذاكرة؛ إن فشلت نكمل بالإنجليزية
+    say('جارٍ تحميل المترجم');
+    try { translator = await pipeline('translation', 'Xenova/opus-mt-en-ar', { progress_callback: onProgress }); }
     catch (e) { console.warn('لا يوجد مترجم', e); }
 
     describeBtn.hidden = repeatBtn.hidden = false; describeBtn.disabled = false;
     say('التطبيق جاهز. اضغط الزر الكبير لوصف ما أمامك');
   } catch (e) {
     console.error(e);
-    say('حدث خطأ. تأكد من السماح بالكاميرا وأعد تحميل الصفحة');
+    say('حدث خطأ. أغلق التطبيقات الأخرى وأعد تحميل الصفحة');
   }
 };
 
@@ -112,30 +89,24 @@ startBtn.onclick = async () => {
 describeBtn.onclick = async () => {
   if (busy) return;
   busy = true; describeBtn.disabled = true;
+  let url;
   try {
     speak('جارٍ التحليل');
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
+    // تصغير الصورة إلى 384 بكسل (حجم مدخل النموذج) لتوفير الذاكرة
+    canvas.width = canvas.height = 384;
+    canvas.getContext('2d').drawImage(video, 0, 0, 384, 384);
     const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.8));
-    const image = await RawImage.fromBlob(blob);
+    url = URL.createObjectURL(blob);
 
-    // تشغيل Florence-2
-    const vision = await processor(image);
-    const text_inputs = tokenizer(processor.construct_prompts(TASK));
-    const ids = await model.generate({ ...text_inputs, ...vision, max_new_tokens: 100 });
-    const decoded = tokenizer.batch_decode(ids, { skip_special_tokens: false })[0];
-    const english = processor.post_process_generation(decoded, TASK, image.size)[TASK];
-
-    // الترجمة إلى العربية
+    const english = (await captioner(url, { max_new_tokens: 30 }))[0].generated_text;
     let arabic = english;
-    if (translator) arabic = (await translator(english, { max_new_tokens: 200 }))[0].translation_text;
+    if (translator) arabic = (await translator(english, { max_new_tokens: 60 }))[0].translation_text;
     say(arabic);
     console.log('EN:', english, '| AR:', arabic);
   } catch (e) {
     console.error(e); say('حدث خطأ، حاول مرة أخرى');
-  } finally { busy = false; describeBtn.disabled = false; }
+  } finally { if (url) URL.revokeObjectURL(url); busy = false; describeBtn.disabled = false; }
 };
-
 repeatBtn.onclick = () => lastText && speak(lastText);
 </script>
 </body>
