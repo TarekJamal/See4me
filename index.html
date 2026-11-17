@@ -27,16 +27,31 @@
   <div id="status" role="status" aria-live="polite">اضغط "ابدأ" لتشغيل التطبيق</div>
   <button id="start">ابدأ</button>
   <button id="describe" hidden disabled aria-label="صِف ما أمامي">صِف ما أمامي</button>
+  <canvas id="canvas" width="300" height="300" hidden></canvas>
   <button id="repeat" hidden aria-label="أعد آخر وصف">أعد آخر وصف</button>
 
 <!-- مكتبتان خفيفتان: TensorFlow.js ونموذج COCO-SSD (~5MB) -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
 <script>
 const $ = id => document.getElementById(id);
 const video = $('video'), statusEl = $('status');
 const startBtn = $('start'), describeBtn = $('describe'), repeatBtn = $('repeat');
 let model, busy = false, lastText = '';
+const canvas = $('canvas'), ctx = canvas.getContext('2d');
+// نصغّر الصورة إلى 300x300 (حجم تدريب النموذج): أسرع بكثير وبنفس الدقة تقريباً
+function grab() { ctx.drawImage(video, 0, 0, 300, 300); return canvas; }
+
+// اختيار أسرع تشغيل متاح: WebGL ثم WASM ثم المعالج، مع التأكد أنه اشتغل فعلاً
+async function pickBackend() {
+  tf.enableProdMode();
+  tf.env().set('WEBGL_FORCE_F16_TEXTURES', true); // أسرع على الهواتف
+  try { tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/'); } catch (e) {}
+  for (const b of ['webgl', 'wasm', 'cpu']) {
+    try { if (await tf.setBackend(b)) { await tf.ready(); return; } } catch (e) { console.warn(b, e); }
+  }
+}
 
 /* قاموس ترجمة أسماء الأشياء الـ 80 التي يتعرف عليها النموذج */
 const AR = {person:'شخص',bicycle:'دراجة',car:'سيارة',motorcycle:'دراجة نارية',airplane:'طائرة',bus:'حافلة',train:'قطار',truck:'شاحنة',boat:'قارب','traffic light':'إشارة مرور','fire hydrant':'صنبور إطفاء','stop sign':'علامة قف','parking meter':'عداد مواقف',bench:'مقعد طويل',bird:'طائر',cat:'قطة',dog:'كلب',horse:'حصان',sheep:'خروف',cow:'بقرة',elephant:'فيل',bear:'دب',zebra:'حمار وحشي',giraffe:'زرافة',backpack:'حقيبة ظهر',umbrella:'مظلة',handbag:'حقيبة يد',tie:'ربطة عنق',suitcase:'حقيبة سفر',frisbee:'قرص طائر',skis:'زلاجات',snowboard:'لوح تزلج على الثلج','sports ball':'كرة',kite:'طائرة ورقية','baseball bat':'مضرب','baseball glove':'قفاز',skateboard:'لوح تزلج',surfboard:'لوح أمواج','tennis racket':'مضرب تنس',bottle:'زجاجة','wine glass':'كأس',cup:'كوب',fork:'شوكة',knife:'سكين',spoon:'ملعقة',bowl:'وعاء',banana:'موزة',apple:'تفاحة',sandwich:'ساندويتش',orange:'برتقالة',broccoli:'بروكلي',carrot:'جزرة','hot dog':'هوت دوج',pizza:'بيتزا',donut:'دونات',cake:'كعكة',chair:'كرسي',couch:'أريكة','potted plant':'نبتة',bed:'سرير','dining table':'طاولة',toilet:'مرحاض',tv:'تلفاز',laptop:'حاسوب محمول',mouse:'فأرة حاسوب',remote:'جهاز تحكم',keyboard:'لوحة مفاتيح','cell phone':'هاتف',microwave:'ميكروويف',oven:'فرن',toaster:'محمصة',sink:'حوض',refrigerator:'ثلاجة',book:'كتاب',clock:'ساعة',vase:'مزهرية',scissors:'مقص','teddy bear':'دمية دب','hair drier':'مجفف شعر',toothbrush:'فرشاة أسنان'};
@@ -69,11 +84,10 @@ startBtn.onclick = async () => {
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 320 } }, audio: false });
     video.srcObject = stream; await video.play();
     say('جارٍ تحميل النموذج');
-    try { await tf.setBackend('webgl'); } catch (e) { await tf.setBackend('cpu'); }
-    await tf.ready();
+    await pickBackend();
     model = await cocoSsd.load({ base: 'lite_mobilenet_v2' }); // الأخف
     statusEl.textContent = 'جارٍ تسخين النموذج';
-    await model.detect(video, 5, 0.5); // أول استدعاء بطيء دائماً، فنجريه الآن مرة
+    await model.detect(grab(), 5, 0.5); // أول استدعاء بطيء دائماً، فنجريه الآن مرة
     describeBtn.hidden = repeatBtn.hidden = false; describeBtn.disabled = false;
     say('التطبيق جاهز. اضغط الزر الكبير لوصف ما أمامك');
   } catch (e) {
@@ -95,9 +109,9 @@ describeBtn.onclick = async () => {
   if (busy) return;
   busy = true; describeBtn.disabled = true;
   try {
-    const W = video.videoWidth, H = video.videoHeight;
+    const W = 300, H = 300;
     const t0 = performance.now();
-    const found = (await model.detect(video, 5, 0.5))
+    const found = (await model.detect(grab(), 5, 0.5))
       .filter(p => AR[p.class])
       .sort((a, b) => b.bbox[2] * b.bbox[3] - a.bbox[2] * a.bbox[3])  // الأكبر أولاً
       .slice(0, 5);
