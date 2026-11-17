@@ -28,17 +28,18 @@
   <button id="start">ابدأ</button>
   <button id="describe" hidden disabled aria-label="صِف ما أمامي">صِف ما أمامي</button>
   <button id="repeat" hidden aria-label="أعد آخر وصف">أعد آخر وصف</button>
-  <canvas id="canvas" hidden></canvas>
 
-<script type="module">
-// نسخة خفيفة: نموذج وصف صغير (~150MB) بدل Florence-2 الثقيل
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
-env.backends.onnx.wasm.numThreads = 1; // أقل استهلاكاً للذاكرة
-
+<!-- مكتبتان خفيفتان: TensorFlow.js ونموذج COCO-SSD (~5MB) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script>
 const $ = id => document.getElementById(id);
-const video = $('video'), statusEl = $('status'), canvas = $('canvas');
+const video = $('video'), statusEl = $('status');
 const startBtn = $('start'), describeBtn = $('describe'), repeatBtn = $('repeat');
-let captioner, translator, busy = false, lastText = '';
+let model, busy = false, lastText = '';
+
+/* قاموس ترجمة أسماء الأشياء الـ 80 التي يتعرف عليها النموذج */
+const AR = {person:'شخص',bicycle:'دراجة',car:'سيارة',motorcycle:'دراجة نارية',airplane:'طائرة',bus:'حافلة',train:'قطار',truck:'شاحنة',boat:'قارب','traffic light':'إشارة مرور','fire hydrant':'صنبور إطفاء','stop sign':'علامة قف','parking meter':'عداد مواقف',bench:'مقعد طويل',bird:'طائر',cat:'قطة',dog:'كلب',horse:'حصان',sheep:'خروف',cow:'بقرة',elephant:'فيل',bear:'دب',zebra:'حمار وحشي',giraffe:'زرافة',backpack:'حقيبة ظهر',umbrella:'مظلة',handbag:'حقيبة يد',tie:'ربطة عنق',suitcase:'حقيبة سفر',frisbee:'قرص طائر',skis:'زلاجات',snowboard:'لوح تزلج على الثلج','sports ball':'كرة',kite:'طائرة ورقية','baseball bat':'مضرب','baseball glove':'قفاز',skateboard:'لوح تزلج',surfboard:'لوح أمواج','tennis racket':'مضرب تنس',bottle:'زجاجة','wine glass':'كأس',cup:'كوب',fork:'شوكة',knife:'سكين',spoon:'ملعقة',bowl:'وعاء',banana:'موزة',apple:'تفاحة',sandwich:'ساندويتش',orange:'برتقالة',broccoli:'بروكلي',carrot:'جزرة','hot dog':'هوت دوج',pizza:'بيتزا',donut:'دونات',cake:'كعكة',chair:'كرسي',couch:'أريكة','potted plant':'نبتة',bed:'سرير','dining table':'طاولة',toilet:'مرحاض',tv:'تلفاز',laptop:'حاسوب محمول',mouse:'فأرة حاسوب',remote:'جهاز تحكم',keyboard:'لوحة مفاتيح','cell phone':'هاتف',microwave:'ميكروويف',oven:'فرن',toaster:'محمصة',sink:'حوض',refrigerator:'ثلاجة',book:'كتاب',clock:'ساعة',vase:'مزهرية',scissors:'مقص','teddy bear':'دمية دب','hair drier':'مجفف شعر',toothbrush:'فرشاة أسنان'};
 
 /* ---------- النطق بالعربية ---------- */
 let arVoice = null;
@@ -58,7 +59,6 @@ function speak(text) {
   speechSynthesis.speak(u);
 }
 function say(text) { statusEl.textContent = text; speak(text); lastText = text; }
-const onProgress = p => { if (p.status === 'progress') statusEl.textContent = `جارٍ التحميل ${Math.round(p.progress)}%`; };
 
 /* ---------- البدء ---------- */
 startBtn.onclick = async () => {
@@ -68,44 +68,39 @@ startBtn.onclick = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 } }, audio: false });
     video.srcObject = stream; await video.play();
-
-    say('جارٍ تحميل نموذج الوصف، يرجى الانتظار');
-    captioner = await pipeline('image-to-text', 'Xenova/vit-gpt2-image-captioning', { progress_callback: onProgress });
-
-    // الترجمة تُحمَّل بعد ذلك (وليس معه) لتخفيف الذاكرة؛ إن فشلت نكمل بالإنجليزية
-    say('جارٍ تحميل المترجم');
-    try { translator = await pipeline('translation', 'Xenova/opus-mt-en-ar', { progress_callback: onProgress }); }
-    catch (e) { console.warn('لا يوجد مترجم', e); }
-
+    say('جارٍ تحميل النموذج');
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' }); // الأخف
     describeBtn.hidden = repeatBtn.hidden = false; describeBtn.disabled = false;
     say('التطبيق جاهز. اضغط الزر الكبير لوصف ما أمامك');
   } catch (e) {
     console.error(e);
-    say('حدث خطأ. أغلق التطبيقات الأخرى وأعد تحميل الصفحة');
+    say('حدث خطأ. تأكد من السماح بالكاميرا وأعد تحميل الصفحة');
   }
 };
 
-/* ---------- التقاط الصورة ووصفها ---------- */
+/* ---------- الاكتشاف والوصف ---------- */
+function place(box, W) {            // الموقع أفقياً
+  const cx = box[0] + box[2] / 2;
+  return cx < W / 3 ? 'على اليسار' : cx > 2 * W / 3 ? 'على اليمين' : 'في الأمام';
+}
+function dist(box, W, H) {          // المسافة التقريبية حسب حجم الصندوق
+  const r = (box[2] * box[3]) / (W * H);
+  return r > 0.35 ? 'قريب جداً' : r > 0.1 ? 'قريب' : 'بعيد';
+}
 describeBtn.onclick = async () => {
   if (busy) return;
   busy = true; describeBtn.disabled = true;
-  let url;
   try {
-    speak('جارٍ التحليل');
-    // تصغير الصورة إلى 384 بكسل (حجم مدخل النموذج) لتوفير الذاكرة
-    canvas.width = canvas.height = 384;
-    canvas.getContext('2d').drawImage(video, 0, 0, 384, 384);
-    const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.8));
-    url = URL.createObjectURL(blob);
-
-    const english = (await captioner(url, { max_new_tokens: 30 }))[0].generated_text;
-    let arabic = english;
-    if (translator) arabic = (await translator(english, { max_new_tokens: 60 }))[0].translation_text;
-    say(arabic);
-    console.log('EN:', english, '| AR:', arabic);
+    const W = video.videoWidth, H = video.videoHeight;
+    const found = (await model.detect(video, 10, 0.5))
+      .filter(p => AR[p.class])
+      .sort((a, b) => b.bbox[2] * b.bbox[3] - a.bbox[2] * a.bbox[3])  // الأكبر أولاً
+      .slice(0, 5);
+    if (!found.length) say('لا أرى أشياء واضحة. حرّك الكاميرا ببطء وحاول مجدداً');
+    else say('أرى: ' + found.map(p => `${AR[p.class]} ${place(p.bbox, W)}، ${dist(p.bbox, W, H)}`).join('. '));
   } catch (e) {
     console.error(e); say('حدث خطأ، حاول مرة أخرى');
-  } finally { if (url) URL.revokeObjectURL(url); busy = false; describeBtn.disabled = false; }
+  } finally { busy = false; describeBtn.disabled = false; }
 };
 repeatBtn.onclick = () => lastText && speak(lastText);
 </script>
