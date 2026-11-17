@@ -10,7 +10,7 @@
   html, body { height: 100%; margin: 0; background: #000; color: #fff; font-family: system-ui, sans-serif; }
   body { display: flex; flex-direction: column; }
   video { width: 100%; max-height: 35vh; object-fit: cover; background: #111; }
-  #status { padding: 12px; font-size: 1.3rem; text-align: center; min-height: 4.5rem; }
+  #status { white-space: pre-line; padding: 12px; font-size: 1.3rem; text-align: center; min-height: 4.5rem; }
   button { border: 0; font-weight: bold; cursor: pointer; }
   #start { margin: auto; padding: 40px 60px; font-size: 2rem; background: #ffd400; color: #000; border-radius: 20px; }
   /* الزر الكبير يأخذ معظم الشاشة ليسهل الضغط عليه دون رؤية */
@@ -66,10 +66,14 @@ startBtn.onclick = async () => {
   try {
     say('جارٍ تشغيل الكاميرا');
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 } }, audio: false });
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 320 } }, audio: false });
     video.srcObject = stream; await video.play();
     say('جارٍ تحميل النموذج');
+    try { await tf.setBackend('webgl'); } catch (e) { await tf.setBackend('cpu'); }
+    await tf.ready();
     model = await cocoSsd.load({ base: 'lite_mobilenet_v2' }); // الأخف
+    statusEl.textContent = 'جارٍ تسخين النموذج';
+    await model.detect(video, 5, 0.5); // أول استدعاء بطيء دائماً، فنجريه الآن مرة
     describeBtn.hidden = repeatBtn.hidden = false; describeBtn.disabled = false;
     say('التطبيق جاهز. اضغط الزر الكبير لوصف ما أمامك');
   } catch (e) {
@@ -92,12 +96,14 @@ describeBtn.onclick = async () => {
   busy = true; describeBtn.disabled = true;
   try {
     const W = video.videoWidth, H = video.videoHeight;
-    const found = (await model.detect(video, 10, 0.5))
+    const t0 = performance.now();
+    const found = (await model.detect(video, 5, 0.5))
       .filter(p => AR[p.class])
       .sort((a, b) => b.bbox[2] * b.bbox[3] - a.bbox[2] * a.bbox[3])  // الأكبر أولاً
       .slice(0, 5);
     if (!found.length) say('لا أرى أشياء واضحة. حرّك الكاميرا ببطء وحاول مجدداً');
     else say('أرى: ' + found.map(p => `${AR[p.class]} ${place(p.bbox, W)}، ${dist(p.bbox, W, H)}`).join('. '));
+    statusEl.textContent += `\n(${Math.round(performance.now() - t0)} ms - ${tf.getBackend()})`;
   } catch (e) {
     console.error(e); say('حدث خطأ، حاول مرة أخرى');
   } finally { busy = false; describeBtn.disabled = false; }
